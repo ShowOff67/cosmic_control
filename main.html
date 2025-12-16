@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Universe Particle System - Hand Control</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; font-family: 'Segoe UI', sans-serif; }
+        
+        canvas.three-canvas { 
+            position: absolute; 
+            top: 0; left: 0; 
+            width: 100vw; height: 100vh; 
+            z-index: 1; 
+        }
+
+        /* HUD UI */
+        #ui-layer {
+            position: absolute;
+            top: 20px; left: 20px;
+            z-index: 10;
+            color: white;
+            pointer-events: none;
+            background: rgba(0, 0, 0, 0.6);
+            padding: 20px;
+            border-radius: 12px;
+            border: 1px solid rgba(0, 255, 255, 0.3);
+            backdrop-filter: blur(8px);
+            max-width: 300px;
+        }
+        
+        h1 { margin: 0 0 10px 0; font-size: 1.4rem; color: #00ffff; text-shadow: 0 0 10px rgba(0,255,255,0.5); }
+        .instruction { margin-bottom: 5px; font-size: 0.9rem; color: #ddd; display: flex; align-items: center; gap: 8px;}
+        .instruction b { color: #fff; min-width: 70px; }
+        
+        .status-box {
+            margin-top: 15px;
+            padding: 10px;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 6px;
+            font-size: 0.85rem;
+            font-family: monospace;
+        }
+
+        .controls {
+            margin-top: 15px;
+            pointer-events: auto;
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        button {
+            background: rgba(0, 0, 0, 0.5);
+            border: 1px solid #00ffff;
+            color: #00ffff;
+            padding: 8px 14px;
+            cursor: pointer;
+            border-radius: 4px;
+            font-weight: bold;
+            transition: all 0.3s;
+            flex: 1 0 30%; /* grow */
+        }
+
+        button:hover { background: #00ffff; color: #000; box-shadow: 0 0 15px #00ffff; }
+
+        /* Camera Preview */
+        #preview-container {
+            position: absolute;
+            bottom: 20px; right: 20px;
+            width: 300px; height: 225px;
+            z-index: 100;
+            border: 2px solid #00ffff;
+            border-radius: 12px;
+            overflow: hidden;
+            background: #000;
+            box-shadow: 0 0 20px rgba(0, 255, 255, 0.2);
+        }
+
+        #preview_canvas { width: 100%; height: 100%; transform: scaleX(-1); }
+        #input_video { display: none; }
+
+        #loading {
+            position: absolute;
+            top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            color: #00ffff;
+            font-size: 1.5rem;
+            z-index: 200;
+            text-align: center;
+            background: rgba(0,0,0,0.85);
+            padding: 30px;
+            border-radius: 15px;
+            border: 1px solid #00ffff;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="loading">Initializing Neural Network...<br><small>Please allow camera access</small></div>
+
+    <div id="ui-layer">
+        <h1>Cosmic Control</h1>
+        <div class="instruction"><b>1 Hand:</b> Rotate & Interact</div>
+        <div class="instruction"><b>2 Hands:</b> Spread to Zoom In</div>
+        <div class="instruction"><b>Pinch:</b> Create Black Hole</div>
+        
+        <div class="status-box" id="status-text">System: Idle</div>
+        
+        <div class="controls">
+            <button onclick="setShape('galaxy')">Galaxy</button>
+            <button onclick="setShape('universe')">Universe</button>
+            <button onclick="setShape('sphere')">Sphere</button>
+            <button onclick="setShape('saturn')">Saturn</button>
+            <button onclick="setShape('flower')">Flower</button>
+            <button onclick="setShape('twist')">Twist</button>
+        </div>
+    </div>
+
+    <div id="preview-container">
+        <canvas id="preview_canvas"></canvas>
+    </div>
+
+    <video id="input_video"></video>
+    
+    <!-- LIBRARIES -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+    <script>
+        // --- CONFIGURATION ---
+        const PARTICLE_COUNT = 25000; // Increased for "Universe" feel
+        const BASE_CAM_Z = 100;
+        
+        // --- THREE.JS VARIABLES ---
+        let scene, camera, renderer, particles, geometry, material;
+        let positions, colors, sizes, targetPositions;
+        let time = 0;
+
+        // --- INTERACTION STATE ---
+        // We track a "virtual target" for the camera to look at or rotate around
+        let rotationTarget = { x: 0, y: 0 }; 
+        let currentRotation = { x: 0, y: 0 };
+        
+        // Hand Logic
+        let numHands = 0;
+        let handCentroid = new THREE.Vector3(); // Average position of hands
+        let pinchStrength = 0; // 0 to 1
+        let handDistance = 0; // For Zoom
+        let zoomLevel = BASE_CAM_Z;
+
+        // --- 1. THREE.JS SETUP ---
+        function initThree() {
+            scene = new THREE.Scene();
+            scene.fog = new THREE.FogExp2(0x000000, 0.005); // Deep space fog
+
+            camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 2000);
+            camera.position.z = BASE_CAM_Z;
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.domElement.className = 'three-canvas';
+            document.body.appendChild(renderer.domElement);
+
+            // -- GEOMETRY SETUP --
+            geometry = new THREE.BufferGeometry();
+            positions = new Float32Array(PARTICLE_COUNT * 3);
+            targetPositions = new Float32Array(PARTICLE_COUNT * 3);
+            colors = new Float32Array(PARTICLE_COUNT * 3);
+            sizes = new Float32Array(PARTICLE_COUNT);
+
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                // Initialize far away
+                positions[i*3] = (Math.random() - 0.5) * 500;
+                positions[i*3+1] = (Math.random() - 0.5) * 500;
+                positions[i*3+2] = (Math.random() - 0.5) * 500;
+                
+                // Varied sizes for "Planets" vs "Stars"
+                // Most are small, some are big
+                const r = Math.random();
+                sizes[i] = r > 0.98 ? 3.0 + Math.random() * 4.0 : 0.5 + Math.random(); 
+
+                colors[i*3] = 1; colors[i*3+1] = 1; colors[i*3+2] = 1;
+            }
+
+            geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+            geometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
+
+            // Custom Shader Material to handle point sizing properly
+            // Using standard PointsMaterial is easier but size attenuation is key for zoom
+            const texture = new THREE.TextureLoader().load('https://threejs.org/examples/textures/sprites/spark1.png');
+
+            material = new THREE.PointsMaterial({
+                size: 1.0,
+                map: texture,
+                vertexColors: true,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false,
+                transparent: true,
+                opacity: 0.9,
+                sizeAttenuation: true // Crucial for zoom effect
+            });
+
+            particles = new THREE.Points(geometry, material);
+            scene.add(particles);
+
+            setShape('galaxy'); // Start with Galaxy
+            window.addEventListener('resize', onWindowResize);
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        // --- 2. SHAPE ALGORITHMS ---
+        window.setShape = function(type) {
+            console.log("Shape:", type);
+            const status = document.getElementById('status-text');
+            status.innerText = `Morphing to: ${type.toUpperCase()}`;
+
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                const idx = i * 3;
+                const u = Math.random();
+                const v = Math.random();
+                
+                let x, y, z;
+
+                if (type === 'universe') {
+                    // Huge box, scattered randomly
+                    const spread = 400;
+                    x = (Math.random() - 0.5) * spread;
+                    y = (Math.random() - 0.5) * spread;
+                    z = (Math.random() - 0.5) * spread;
+                    // Add some dense clusters
+                    if (Math.random() > 0.9) {
+                        x *= 0.1; y *= 0.1; z *= 0.1;
+                    }
+                }
+                else if (type === 'galaxy') {
+                    // Logarithmic Spiral
+                    const arms = 3;
+                    const armIndex = i % arms;
+                    const radius = Math.random() * 80;
+                    const spin = radius * 0.2; // tighter spiral
+                    const angle = (armIndex / arms) * Math.PI * 2 + spin;
+                    
+                    // Randomness based on radius (core is tighter)
+                    const spread = Math.max(1, radius * 0.2); 
+
+                    x = Math.cos(angle) * radius + (Math.random()-0.5)*spread;
+                    z = Math.sin(angle) * radius + (Math.random()-0.5)*spread;
+                    y = (Math.random() - 0.5) * spread * 0.5; // Flattened disk
+                }
+                else if (type === 'sphere') {
+                    const r = 40;
+                    const theta = 2 * Math.PI * u;
+                    const phi = Math.acos(2 * v - 1);
+                    x = r * Math.sin(phi) * Math.cos(theta);
+                    y = r * Math.sin(phi) * Math.sin(theta);
+                    z = r * Math.cos(phi);
+                }
+                else if (type === 'saturn') {
+                   // Planet
+                   if (Math.random() > 0.4) {
+                       const r = 15;
+                       const theta = Math.random() * Math.PI * 2;
+                       const phi = Math.acos(2 * Math.random() - 1);
+                       x = r * Math.sin(phi) * Math.cos(theta);
+                       y = r * Math.sin(phi) * Math.sin(theta);
+                       z = r * Math.cos(phi);
+                   } else {
+                       // Rings
+                       const r = 25 + Math.random() * 20;
+                       const ang = Math.random() * Math.PI * 2;
+                       x = r * Math.cos(ang);
+                       z = r * Math.sin(ang);
+                       y = (Math.random() - 0.5);
+                   }
+                }
+                else if (type === 'flower') {
+                    const k = 6;
+                    const r = (20 * Math.cos(k * u * Math.PI * 2)) + 10;
+                    const theta = u * Math.PI * 2;
+                    x = r * Math.cos(theta);
+                    y = r * Math.sin(theta);
+                    z = (v - 0.5) * 20;
+                }
+                else if (type === 'twist') {
+                    const r = 10 + v * 30;
+                    const spiral = u * Math.PI * 15;
+                    x = r * Math.cos(spiral);
+                    y = (u - 0.5) * 100;
+                    z = r * Math.sin(spiral);
+                }
+
+                targetPositions[idx] = x;
+                targetPositions[idx+1] = y;
+                targetPositions[idx+2] = z;
+            }
+        };
+
+        // --- 3. PHYSICS & ANIMATION ---
+        function animate() {
+            requestAnimationFrame(animate);
+            time += 0.01;
+
+            const pos = geometry.attributes.position.array;
+            const col = geometry.attributes.color.array;
+
+            // --- A. CAMERA ZOOM (2 Hands) ---
+            // Smoothly interpolate camera position
+            // Min zoom 10 (very close), Max zoom 200 (far)
+            camera.position.z += (zoomLevel - camera.position.z) * 0.05;
+
+            // --- B. SCENE ROTATION (1 Hand) ---
+            // Smoothly rotate the entire particle system based on hand position
+            currentRotation.x += (rotationTarget.x - currentRotation.x) * 0.05;
+            currentRotation.y += (rotationTarget.y - currentRotation.y) * 0.05;
+            
+            particles.rotation.y = currentRotation.x; // Left/Right hand moves
+            particles.rotation.x = currentRotation.y; // Up/Down hand moves
+
+            // Interaction Vector in World Space
+            // Map hand centroid (-1 to 1) to world units relative to zoom
+            const interactX = handCentroid.x * (camera.position.z * 0.5);
+            const interactY = handCentroid.y * (camera.position.z * 0.5);
+
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                const ix = i * 3;
+                let px = pos[ix];
+                let py = pos[ix+1];
+                let pz = pos[ix+2];
+
+                const tx = targetPositions[ix];
+                const ty = targetPositions[ix+1];
+                const tz = targetPositions[ix+2];
+
+                // Base Lerp to shape
+                const lerpFactor = 0.02;
+                let vx = (tx - px) * lerpFactor;
+                let vy = (ty - py) * lerpFactor;
+                let vz = (tz - pz) * lerpFactor;
+
+                // --- C. HAND INTERACTION PHYSICS ---
+                if (numHands > 0) {
+                    const dx = px - interactX;
+                    const dy = py - interactY;
+                    const dz = pz - 0; // Assume interaction plane at Z=0 relative to rotation
+                    
+                    const distSq = dx*dx + dy*dy + dz*dz;
+                    const dist = Math.sqrt(distSq);
+
+                    // PINCH (Black Hole)
+                    if (pinchStrength > 0.8) {
+                        if (dist > 2) {
+                            const force = 300 / distSq; 
+                            vx -= dx * force * 0.05;
+                            vy -= dy * force * 0.05;
+                            vz -= dz * force * 0.05;
+                        }
+                        // Color red near center
+                        const heat = Math.max(0, 1 - dist/30);
+                        col[ix] = 1.0; 
+                        col[ix+1] = 1.0 - heat; 
+                        col[ix+2] = 1.0 - heat; 
+                    } 
+                    // OPEN HAND (Repel)
+                    else {
+                        if (dist < 30) {
+                            const force = (30 - dist) * 0.02;
+                            vx += dx * force;
+                            vy += dy * force;
+                            vz += dz * force;
+                            
+                            // Color Blue/Cyan
+                            col[ix] = 0.2; 
+                            col[ix+1] = 0.8; 
+                            col[ix+2] = 1.0;
+                        } else {
+                             // Reset colors slowly
+                             col[ix] += (1 - col[ix]) * 0.02;
+                             col[ix+1] += (1 - col[ix+1]) * 0.02;
+                             col[ix+2] += (1 - col[ix+2]) * 0.02;
+                        }
+                    }
+                } else {
+                     // Reset colors if no hand
+                     col[ix] += (1 - col[ix]) * 0.01;
+                     col[ix+1] += (1 - col[ix+1]) * 0.01;
+                     col[ix+2] += (1 - col[ix+2]) * 0.01;
+                }
+
+                pos[ix] += vx;
+                pos[ix+1] += vy;
+                pos[ix+2] += vz;
+                
+                // Add twinkle
+                if(Math.random() > 0.99) {
+                     col[ix] = 1; col[ix+1] = 1; col[ix+2] = 1;
+                }
+            }
+
+            geometry.attributes.position.needsUpdate = true;
+            geometry.attributes.color.needsUpdate = true;
+            renderer.render(scene, camera);
+        }
+
+
+        // --- 4. COMPUTER VISION LOGIC ---
+        const videoElement = document.getElementById('input_video');
+        const previewCanvas = document.getElementById('preview_canvas');
+        const canvasCtx = previewCanvas.getContext('2d');
+        const statusBox = document.getElementById('status-text');
+
+        function onResults(results) {
+            document.getElementById('loading').style.display = 'none';
+
+            // Draw Preview
+            previewCanvas.width = videoElement.videoWidth;
+            previewCanvas.height = videoElement.videoHeight;
+            canvasCtx.save();
+            canvasCtx.clearRect(0, 0, previewCanvas.width, previewCanvas.height);
+            canvasCtx.drawImage(results.image, 0, 0, previewCanvas.width, previewCanvas.height);
+
+            const landmarks = results.multiHandLandmarks;
+            numHands = landmarks ? landmarks.length : 0;
+
+            if (numHands > 0) {
+                // Draw skeleton
+                for (const handLms of landmarks) {
+                    drawConnectors(canvasCtx, handLms, HAND_CONNECTIONS, {color: '#00ffff', lineWidth: 3});
+                    drawLandmarks(canvasCtx, handLms, {color: '#ff0055', lineWidth: 1, radius: 3});
+                }
+
+                // --- LOGIC: ONE HAND VS TWO HANDS ---
+                
+                // Primary Hand (First detected)
+                const h1 = landmarks[0];
+                const h1_idx = h1[8]; // Index Tip
+                const h1_thb = h1[4]; // Thumb Tip
+                const h1_mid = h1[9]; // Middle Knuckle (Stable center)
+
+                // 1. Calculate Pinch (Thumb-Index distance)
+                const pinchDist = Math.hypot(h1_idx.x - h1_thb.x, h1_idx.y - h1_thb.y);
+                pinchStrength = pinchDist < 0.05 ? 1 : 0; // Binary pinch for simplicity
+
+                if (numHands === 2) {
+                    // --- TWO HAND ZOOM LOGIC ---
+                    const h2 = landmarks[1];
+                    const h2_mid = h2[9];
+
+                    // Draw line between hands
+                    canvasCtx.beginPath();
+                    canvasCtx.moveTo(h1_mid.x * previewCanvas.width, h1_mid.y * previewCanvas.height);
+                    canvasCtx.lineTo(h2_mid.x * previewCanvas.width, h2_mid.y * previewCanvas.height);
+                    canvasCtx.strokeStyle = "#FFFF00";
+                    canvasCtx.lineWidth = 4;
+                    canvasCtx.stroke();
+
+                    // Calculate distance between two hands
+                    const dist = Math.hypot(h1_mid.x - h2_mid.x, h1_mid.y - h2_mid.y);
+                    
+                    // Map distance to Zoom 
+                    // Close hands (0.2) = Zoom Out (Far Z)
+                    // Far hands (0.8) = Zoom In (Close Z)
+                    // Inverse logic: Usually expanding hands means "Make object bigger" -> Zoom In
+                    
+                    // Mapping: Distance 0.1 -> Z 200, Distance 0.8 -> Z 10
+                    // Let's smooth it.
+                    const targetZ = 200 - (dist * 200); 
+                    zoomLevel = Math.max(10, Math.min(200, targetZ));
+                    
+                    statusBox.innerText = `Mode: ZOOM (${Math.round(zoomLevel)})`;
+                    
+                    // Reset single hand rotation centroid to center to prevent spinning while zooming
+                    handCentroid.set(0,0,0);
+
+                } else {
+                    // --- ONE HAND ROTATION LOGIC ---
+                    // Map hand position (0..1) to Rotation Angle
+                    // X: 0..1 -> -1..1
+                    // Y: 0..1 -> 1..-1
+                    
+                    const x = (1 - h1_mid.x) * 2 - 1; 
+                    const y = -(h1_mid.y * 2 - 1);
+
+                    // Update Hand Centroid for physics Attraction/Repulsion
+                    handCentroid.set(x, y, 0);
+
+                    // Update Rotation Target
+                    // Allow 360 degree rotation capability
+                    rotationTarget.x = x * 2; // Yaw
+                    rotationTarget.y = y * 0.5; // Pitch (limited)
+
+                    statusBox.innerText = pinchStrength ? "Mode: BLACK HOLE" : "Mode: ROTATE & REPEL";
+                }
+
+            } else {
+                statusBox.innerText = "System: Idle (Show Hands)";
+                pinchStrength = 0;
+            }
+
+            canvasCtx.restore();
+        }
+
+        // --- INIT MEDIAPIPE ---
+        const hands = new Hands({locateFile: (file) => {
+            return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+        }});
+
+        hands.setOptions({
+            maxNumHands: 2, // ENABLE 2 HANDS
+            modelComplexity: 1,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+
+        hands.onResults(onResults);
+
+        const cameraUtils = new Camera(videoElement, {
+            onFrame: async () => {
+                await hands.send({image: videoElement});
+            },
+            width: 640,
+            height: 480
+        });
+
+        initThree();
+        cameraUtils.start();
+        animate();
+
+    </script>
+</body>
+</html>
